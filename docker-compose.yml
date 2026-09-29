@@ -1,0 +1,29 @@
+services:
+  rule-engine:
+    build: .
+    image: rule-decision-service:latest
+    container_name: rule-decision-service
+    ports:
+      - "8000:8000"
+    environment:
+      # 容器内固定路径，挂载到命名卷以持久化 SQLite 数据
+      DATABASE_URL: "sqlite:////data/rules.db"
+      SEED_DEMO: "1"
+    volumes:
+      - rule-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); sys.exit(0 if json.load(r).get('status')=='ok' else 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  rule-data:
