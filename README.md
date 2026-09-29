@@ -195,6 +195,9 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/api/rulesets/{id}/evaluations` | 列出该规则集的历史决策结果 |
 | `GET`  | `/api/rulesets/{id}/evaluation-stats` | 聚合已持久化决策：规则命中率与决策字段统计（支持 `version` / `since` / `until` 筛选） |
 | `GET`  | `/api/evaluations/{eval_id}` | 按 ID 查询单次决策结果 |
+| `POST` | `/api/evaluations/{eval_id}/corrections` | 对已落库决策提交人工复核更正（修订），乐观并发 + 业务请求号幂等 |
+| `GET`  | `/api/evaluations/{eval_id}/effective-decision` | 查询当前有效 decision（有更正时取最后一条，否则取原计算结果） |
+| `GET`  | `/api/evaluations/{eval_id}/corrections` | 按修订号升序列出该决策的全部更正记录 |
 | `POST` | `/api/rulesets/{id}/recompute` | 用旧文档对最新版重算（保留旧结果） |
 
 ### 三分钟试用
@@ -312,6 +315,149 @@ curl -i -X POST 'localhost:8000/api/rulesets/demo-promotions/evaluate?persist=fa
 
 > 幂等能力仅用于**单文档** `evaluate`；批量（evaluate-batch）、覆盖
 > （coverage）、预演（compare）、重算（recompute）不接受幂等键。
+
+### 决策人工更正（修订）
+
+已落库的决策结果在**人工复核**后可形成一条**更正记录**：更正不重算、不改
+原始决策，而是在原结果之上追加不可变修订。**原计算结果视为修订 0**，每成功
+更正一次修订号递增 1，可随时查询**当前有效 decision** 与**按序更正记录**。
+
+提交更正 `POST /api/evaluations/{eval_id}/corrections`，请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `base_revision` | 提交时依据的**基准修订号**（≥0）；必须等于该决策当前修订号才能更正 |
+| `request_no` | 业务请求号（1～255 字符，自动去除首尾空白）；同一决策内幂等 |
+| `decision` | **完整的替代 decision 对象**（必须是 JSON 对象，允许为空对象 `{}`） |
+
+行为语义：
+
+- **首次更正**：基准修订号等于当前修订号（首次为 0）→ HTTP **201**，修订号
+  在写锁内按当前最大值 +1，返回包含 `revision` / `base_revision` /
+  `request_no` / 替代 `decision` 的更正记录；
+- **相同重试幂等**：同一决策的**同一 `request_no`** 且**相同基准修订号与相同
+  替代内容**（替代对象按对象键递归排序规范化，键序不同视为相同；数组顺序属于
+  语义）**，直接返回首次更正记录（HTTP **200**，`id` 与首次一致）——
+  **即使其后已有后续更正、提交的基准已过期，也不重复写入**；
+- **过期基准冲突**：`base_revision` 不等于当前修订号 → HTTP **409**
+  `CORRECTION_REVISION_CONFLICT`，`details` 回显 `base_revision` 与
+  `current_revision`；
+- **同号冲突**：同 `request_no` 但基准修订号或替代内容不同 → HTTP **409**
+  `CORRECTION_REQUEST_CONFLICT`，`details.field` 区分 `base_revision` /
+  `decision`（前者还回显 `original` / `conflicting`）；
+- **不存在**：找不到已落库决策 → HTTP **404** `NOT_FOUND`（三个更正相关接口
+  均如此）；
+- **请求校验**：`base_revision<0`、`request_no` 为空白、`decision` 不是 JSON
+  对象 → HTTP **422**。
+
+更正的边界保证：
+
+- **不改原始决策**：`GET /api/evaluations/{id}` 与该规则集的
+  `evaluations` 历史仍返回原计算结果（原 `decision`、命中规则、traces、
+  创建时间均不变）；
+- **不改所用规则版本**：更正与规则集版本无关，不触发任何重编译/重算；
+- **不改评估统计**：`evaluation-stats` 只聚合原始落库结果，替代 decision 不
+  计入命中与字段统计；
+- 更正只影响 `effective-decision` 的当前取值，与原始结果互不覆盖。
+
+`GET /api/evaluations/{id}/effective-decision` 返回当前有效 decision：
+
+| 字段 | 说明 |
+| --- | --- |
+| `current_revision` | 当前修订号；无更正为 0 |
+| `decision` | 有更正时为**最后一条**更正的替代对象，否则为原计算 decision |
+| `corrected` | 是否存在至少一条更正 |
+| `latest_correction_id` | 当前内容对应的更正记录 ID；无更正为 `null` |
+
+`GET /api/evaluations/{id}/corrections` 返回
+`{evaluation_id, current_revision, items}`，`items` **按修订号升序**
+（修订 0 的原结果不在其中）。
+
+并发安全：提交先无锁快查 `request_no`；未命中则 `BEGIN IMMEDIATE` 取写锁后
+复查，保证同一 `(决策, 请求号)` 并发只有一个真正写入，其余回放首次记录。
+
+请求示例：
+
+```bash
+# 0) 先拿到一条已落库决策（修订 0）
+EID=$(curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"document": {"amount": 1500, "customer": {"vip": true}}}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+echo "$EID"
+
+# 1) 首次更正：base_revision=0 → 201，修订号变为 1
+curl -i -X POST localhost:8000/api/evaluations/$EID/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base_revision": 0,
+    "request_no": "review-20260929-0001",
+    "decision": {"discount": 0.2, "free_shipping": true, "reviewed": true}
+  }'
+# HTTP/1.1 201 Created
+# {"id": "2fe0…", "evaluation_id": "…", "revision": 1,
+#  "request_no": "review-20260929-0001", "base_revision": 0,
+#  "decision": {"discount": 0.2, "free_shipping": true, "reviewed": true},
+#  "created_at": "2026-09-29T15:44:35+00:00"}
+
+# 2) 同一请求重试（对象键序不同也视为相同）→ 200，返回首次记录，不重复写入
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  localhost:8000/api/evaluations/$EID/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base_revision": 0,
+    "request_no": "review-20260929-0001",
+    "decision": {"reviewed": true, "free_shipping": true, "discount": 0.2}
+  }'
+# 200
+
+# 3) 第二次更正：基准必须为当前修订号 1 → 201，修订号变为 2
+curl -s -X POST localhost:8000/api/evaluations/$EID/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base_revision": 1,
+    "request_no": "review-20260929-0002",
+    "decision": {"discount": 0.25, "free_shipping": false}
+  }' | python3 -m json.tool
+
+# 4) 查询当前有效 decision（取修订 2 的替代对象）
+curl -s localhost:8000/api/evaluations/$EID/effective-decision | python3 -m json.tool
+# {"evaluation_id": "…", "current_revision": 2,
+#  "decision": {"discount": 0.25, "free_shipping": false},
+#  "corrected": true, "latest_correction_id": "036c…"}
+
+# 5) 按序更正记录（修订号升序；不含修订 0）
+curl -s localhost:8000/api/evaluations/$EID/corrections | python3 -m json.tool
+```
+
+过期基准 → 409：
+
+```bash
+curl -i -X POST localhost:8000/api/evaluations/$EID/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision": 0, "request_no": "review-stale", "decision": {"x": 1}}'
+# HTTP/1.1 409 Conflict
+# {"error": {"code": "CORRECTION_REVISION_CONFLICT",
+#   "message": "基准修订号已过期：该决策当前修订号与提交的基准修订号不一致",
+#   "details": {"evaluation_id": "…", "base_revision": 0, "current_revision": 2}}}
+```
+
+同请求号不同基准或不同替代内容 → 409：
+
+```bash
+curl -i -X POST localhost:8000/api/evaluations/$EID/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision": 2, "request_no": "review-20260929-0001",
+       "decision": {"discount": 0.2, "free_shipping": true, "reviewed": true}}'
+# HTTP/1.1 409 Conflict
+# {"error": {"code": "CORRECTION_REQUEST_CONFLICT",
+#   "message": "业务请求号已用于不同的基准修订号",
+#   "details": {"field": "base_revision", "original": 0, "conflicting": 2, …}}}
+```
+
+> 即使已有修订 2，用**原请求号 + 原基准 0 + 原替代内容**重试仍返回首次
+> （修订 1）记录而非冲突；只有基准或内容**与该请求号首次提交不一致**时才报
+> `CORRECTION_REQUEST_CONFLICT`。
 
 ### 批量评估
 
@@ -1025,5 +1171,9 @@ pytest -q
 版本号按目标递增不采用包内版本/摘要不符与重编译失败不写库/400 与 404）、
 单文档决策客户端幂等键（首次落库并固定版本/同键重放返回首次记录 ID/
 新版本发布仍固定首次版本/文档按对象键排序规范化/同键不同文档或版本选择方式 409/
-求值失败不占键/非持久化携带键 400/无键行为不变/键按规则集隔离/并发只落一条），
+求值失败不占键/非持久化携带键 400/无键行为不变/键按规则集隔离/并发只落一条）、
+决策人工更正（首条更正修订 0→1 与连续递增/当前有效 decision 与按序更正记录/
+同请求号同基准同内容重试回放首次且后续更正后仍不重复写入/替代对象键序规范化/
+过期基准 409/同号不同基准或内容 409/更正不改原始决策·规则版本·评估统计/
+非对象 decision 与空白请求号 422/决策不存在 404/同请求号并发只落一条），
 以及完整 HTTP 接口。

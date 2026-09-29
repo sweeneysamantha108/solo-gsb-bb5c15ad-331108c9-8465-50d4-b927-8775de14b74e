@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 ConflictPolicy = Literal["collect_all", "priority", "first_hit"]
 
@@ -196,6 +196,63 @@ class EvaluationOut(BaseModel):
     conflicts: list[dict[str, Any]]
     traces: list[dict[str, Any]]
     created_at: str
+
+
+class DecisionCorrectionRequest(BaseModel):
+    base_revision: int = Field(
+        ...,
+        ge=0,
+        description="提交时依据的基准修订号；必须等于该决策当前修订号才能更正",
+    )
+    request_no: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="业务请求号；同一决策内相同请求号重试具有幂等语义",
+    )
+    decision: dict[str, Any] = Field(
+        ...,
+        description="完整的替代 decision 对象（人工复核后的最终决策，必须为 JSON 对象）",
+    )
+
+    @field_validator("request_no")
+    @classmethod
+    def _request_no_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("业务请求号不能为空白字符串")
+        return value.strip()
+
+
+class DecisionCorrectionOut(BaseModel):
+    id: str = Field(..., description="更正记录 ID")
+    evaluation_id: str = Field(..., description="被更正的已落库决策 ID")
+    revision: int = Field(..., description="本次更正产生的修订号（原计算结果为 0，首条为 1）")
+    request_no: str = Field(..., description="业务请求号")
+    base_revision: int = Field(..., description="提交时的基准修订号")
+    decision: dict[str, Any] = Field(..., description="该修订的完整替代 decision 对象")
+    created_at: str
+
+
+class EffectiveDecisionOut(BaseModel):
+    evaluation_id: str
+    current_revision: int = Field(
+        ..., description="当前修订号；无更正时为 0（即原计算结果）"
+    )
+    decision: dict[str, Any] = Field(
+        ..., description="当前有效 decision：有更正时为最后一条更正的替代对象，否则为原决策"
+    )
+    corrected: bool = Field(..., description="是否存在至少一条更正")
+    latest_correction_id: str | None = Field(
+        None, description="当前有效内容对应的更正记录 ID；无更正时为 null"
+    )
+
+
+class DecisionCorrectionListOut(BaseModel):
+    evaluation_id: str
+    current_revision: int
+    items: list[DecisionCorrectionOut] = Field(
+        ..., description="按修订号升序的全部更正记录（不含修订 0 的原计算结果）"
+    )
 
 
 class CoverageRequest(BaseModel):

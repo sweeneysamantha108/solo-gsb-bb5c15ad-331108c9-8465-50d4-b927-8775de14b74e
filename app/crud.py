@@ -53,6 +53,16 @@ class IdempotencyConflict(ValueError):
         self.details = details or {}
 
 
+class CorrectionConflict(ValueError):
+    """决策更正冲突：基准修订号过期，或同业务请求号重试内容与首次不一致。"""
+
+    def __init__(self, code: str, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
+
 def canonical_json(value: Any) -> str:
     """递归按对象键排序的规范化 JSON（紧凑、UTF-8、不转义非 ASCII）。
 
@@ -786,3 +796,217 @@ def _row_to_evaluation(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         **result,
     }
+
+
+# ---------- 决策更正（人工复核修订） ----------
+
+
+def decision_fingerprint(decision: Any) -> tuple[str, str]:
+    """返回 (规范化替代 decision JSON, 其 sha256)。
+
+    与文档幂等一致：对象按 sort_keys 规范化，键序不同的等价对象视为同一
+    替代内容；数组按下标保序。
+    """
+    canonical = canonical_json(decision)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return canonical, digest
+
+
+def current_revision(conn: sqlite3.Connection, evaluation_id: str) -> int:
+    """该决策的当前修订号：无更正为 0，否则为最大修订号。"""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(revision), 0) AS rev FROM decision_corrections "
+        "WHERE evaluation_id = ?",
+        (evaluation_id,),
+    ).fetchone()
+    return int(row["rev"] or 0)
+
+
+def get_correction(
+    conn: sqlite3.Connection, evaluation_id: str, request_no: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM decision_corrections "
+        "WHERE evaluation_id = ? AND request_no = ?",
+        (evaluation_id, request_no),
+    ).fetchone()
+
+
+def _row_to_correction(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "evaluation_id": row["evaluation_id"],
+        "revision": row["revision"],
+        "request_no": row["request_no"],
+        "base_revision": row["base_revision"],
+        "decision": json.loads(row["decision"]),
+        "created_at": row["created_at"],
+    }
+
+
+def list_corrections(
+    conn: sqlite3.Connection, evaluation_id: str
+) -> list[dict[str, Any]]:
+    """按修订号升序列出全部更正记录（修订 0 为原计算结果，不在其中）。"""
+    rows = conn.execute(
+        "SELECT * FROM decision_corrections WHERE evaluation_id = ? ORDER BY revision",
+        (evaluation_id,),
+    ).fetchall()
+    return [_row_to_correction(r) for r in rows]
+
+
+def get_effective_decision(
+    conn: sqlite3.Connection, evaluation_id: str
+) -> dict[str, Any] | None:
+    """当前有效 decision：有更正时取最后一条更正的替代对象，否则取原决策。
+
+    决策（evaluations 行）不存在返回 None。
+    """
+    evaluation = get_evaluation(conn, evaluation_id)
+    if evaluation is None:
+        return None
+    latest = conn.execute(
+        """SELECT * FROM decision_corrections
+           WHERE evaluation_id = ?
+           ORDER BY revision DESC
+           LIMIT 1""",
+        (evaluation_id,),
+    ).fetchone()
+    if latest is None:
+        return {
+            "evaluation_id": evaluation_id,
+            "current_revision": 0,
+            "decision": evaluation["decision"],
+            "corrected": False,
+            "latest_correction_id": None,
+        }
+    return {
+        "evaluation_id": evaluation_id,
+        "current_revision": latest["revision"],
+        "decision": json.loads(latest["decision"]),
+        "corrected": True,
+        "latest_correction_id": latest["id"],
+    }
+
+
+def apply_correction(
+    conn: sqlite3.Connection,
+    evaluation_id: str,
+    base_revision: int,
+    request_no: str,
+    decision: Any,
+):
+    """对已落库决策追加一条人工更正（乐观并发 + 业务请求号幂等）。
+
+    返回 (correction, created)：
+    - created=True：新建更正，修订号在锁内按当前最大值 +1；
+    - created=False：同 (决策, 请求号) 且相同基准修订号与相同替代内容的重试，
+      直接返回首次更正记录，即使其后已有更新的更正也不重复写入。
+
+    冲突（均抛 :class:`CorrectionConflict`，HTTP 409，事务回滚不写库）：
+    - 基准修订号不等于当前修订号（过期基准）：CORRECTION_REVISION_CONFLICT；
+    - 同请求号但基准修订号不同：CORRECTION_REQUEST_CONFLICT / field=base_revision；
+    - 同请求号但替代内容不同：CORRECTION_REQUEST_CONFLICT / field=decision。
+
+    并发安全：先无锁快查该请求号；随后 BEGIN IMMEDIATE 取写锁复查，
+    同请求号并发只有一个真正写入。
+    """
+    canonical, decision_hash = decision_fingerprint(decision)
+
+    # 无锁快查：同请求号重试直接回放/判冲突，避免无谓取锁
+    existing = get_correction(conn, evaluation_id, request_no)
+    if existing is not None:
+        return _replay_correction_or_conflict(
+            existing, base_revision, decision_hash
+        ), False
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 取写锁后复查：并发请求可能已完成首次写入
+        existing = get_correction(conn, evaluation_id, request_no)
+        if existing is not None:
+            return _replay_correction_or_conflict(
+                existing, base_revision, decision_hash
+            ), False
+
+        if get_evaluation(conn, evaluation_id) is None:
+            raise LookupError(f"决策结果不存在：{evaluation_id}")
+
+        current = current_revision(conn, evaluation_id)
+        if base_revision != current:
+            raise CorrectionConflict(
+                "CORRECTION_REVISION_CONFLICT",
+                "基准修订号已过期：该决策当前修订号与提交的基准修订号不一致",
+                {
+                    "evaluation_id": evaluation_id,
+                    "base_revision": base_revision,
+                    "current_revision": current,
+                },
+            )
+
+        new_revision = current + 1
+        correction_id = new_id()
+        ts = now()
+        conn.execute(
+            """INSERT INTO decision_corrections
+               (id, evaluation_id, revision, request_no, base_revision,
+                decision, decision_hash, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                correction_id,
+                evaluation_id,
+                new_revision,
+                request_no,
+                base_revision,
+                canonical,
+                decision_hash,
+                ts,
+            ),
+        )
+        record = {
+            "id": correction_id,
+            "evaluation_id": evaluation_id,
+            "revision": new_revision,
+            "request_no": request_no,
+            "base_revision": base_revision,
+            "decision": decision,
+            "created_at": ts,
+        }
+        return record, True
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _replay_correction_or_conflict(
+    existing: sqlite3.Row, base_revision: int, decision_hash: str
+) -> dict[str, Any]:
+    """同业务请求号重试：基准与内容一致则回放首次记录；任一不同即冲突。
+
+    注意回放优先于“基准是否为当前修订号”的判断——首次更正之后即使已有
+    后续更正（请求中的 base_revision 因而过期），只要是同一请求的重试
+    仍返回首次记录。
+    """
+    if existing["base_revision"] != base_revision:
+        raise CorrectionConflict(
+            "CORRECTION_REQUEST_CONFLICT",
+            "业务请求号已用于不同的基准修订号",
+            {
+                "evaluation_id": existing["evaluation_id"],
+                "request_no": existing["request_no"],
+                "field": "base_revision",
+                "original": existing["base_revision"],
+                "conflicting": base_revision,
+            },
+        )
+    if existing["decision_hash"] != decision_hash:
+        raise CorrectionConflict(
+            "CORRECTION_REQUEST_CONFLICT",
+            "业务请求号已用于不同的替代 decision 内容",
+            {
+                "evaluation_id": existing["evaluation_id"],
+                "request_no": existing["request_no"],
+                "field": "decision",
+            },
+        )
+    return _row_to_correction(existing)

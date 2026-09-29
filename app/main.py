@@ -33,6 +33,10 @@ from .schemas import (
     CompareRequest,
     CoverageOut,
     CoverageRequest,
+    DecisionCorrectionListOut,
+    DecisionCorrectionOut,
+    DecisionCorrectionRequest,
+    EffectiveDecisionOut,
     ErrorResponse,
     EvaluateBatchRequest,
     EvaluateRequest,
@@ -918,3 +922,92 @@ def get_evaluation(
     if record is None:
         return _error("NOT_FOUND", f"决策结果不存在：{evaluation_id}", 404)
     return record
+
+
+# ---------- 决策更正（人工复核修订） ----------
+
+
+@app.post(
+    "/api/evaluations/{evaluation_id}/corrections",
+    response_model=DecisionCorrectionOut,
+    tags=["decision-correction"],
+    responses={
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+    },
+)
+def create_correction(
+    evaluation_id: str,
+    req: DecisionCorrectionRequest,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """对已落库决策提交一条人工复核更正（修订 0 为原计算结果）。
+
+    - 只有 ``base_revision`` 等于该决策**当前修订号**时才能更正；成功后
+      修订号 +1。原计算结果、所用规则版本与现有评估统计均不被修改；
+    - 同一决策的同一 ``request_no`` 携带**相同基准修订号与相同替代
+      decision** 重试时，直接返回**首次**更正记录（即使其后已有更新的
+      更正也不重复写入，HTTP 200）；首次成功写入返回 HTTP 201；
+    - 同请求号但基准修订号或替代内容不同 → 409
+      ``CORRECTION_REQUEST_CONFLICT``；基准修订号不等于当前修订号（过期
+      基准）→ 409 ``CORRECTION_REVISION_CONFLICT``；
+    - 找不到已落库决策 → 404 ``NOT_FOUND``。
+    """
+    if crud.get_evaluation(conn, evaluation_id) is None:
+        return _error("NOT_FOUND", f"决策结果不存在：{evaluation_id}", 404)
+
+    request_no = req.request_no.strip()
+    try:
+        correction, created = crud.apply_correction(
+            conn,
+            evaluation_id,
+            req.base_revision,
+            request_no,
+            req.decision,
+        )
+    except LookupError:
+        # 事务已回滚；并发删除等极端情况下的兜底
+        return _error("NOT_FOUND", f"决策结果不存在：{evaluation_id}", 404)
+    except crud.CorrectionConflict as exc:
+        return _error(exc.code, exc.message, 409, details=exc.details)
+
+    response.status_code = 201 if created else 200
+    return correction
+
+
+@app.get(
+    "/api/evaluations/{evaluation_id}/effective-decision",
+    response_model=EffectiveDecisionOut,
+    tags=["decision-correction"],
+    responses={404: {"model": ErrorResponse}},
+)
+def get_effective_decision(
+    evaluation_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> Any:
+    """查询当前有效 decision：有更正时为最后一条更正的替代对象，否则为原决策。"""
+    effective = crud.get_effective_decision(conn, evaluation_id)
+    if effective is None:
+        return _error("NOT_FOUND", f"决策结果不存在：{evaluation_id}", 404)
+    return effective
+
+
+@app.get(
+    "/api/evaluations/{evaluation_id}/corrections",
+    response_model=DecisionCorrectionListOut,
+    tags=["decision-correction"],
+    responses={404: {"model": ErrorResponse}},
+)
+def list_corrections(
+    evaluation_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> Any:
+    """按修订号升序列出该决策的全部更正记录（修订 0 为原结果，不在列表中）。"""
+    if crud.get_evaluation(conn, evaluation_id) is None:
+        return _error("NOT_FOUND", f"决策结果不存在：{evaluation_id}", 404)
+    items = crud.list_corrections(conn, evaluation_id)
+    return {
+        "evaluation_id": evaluation_id,
+        "current_revision": crud.current_revision(conn, evaluation_id),
+        "items": items,
+    }
