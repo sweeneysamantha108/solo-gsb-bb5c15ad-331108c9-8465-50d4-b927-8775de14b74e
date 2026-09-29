@@ -195,6 +195,9 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/api/rulesets/{id}/evaluations` | 列出该规则集的历史决策结果 |
 | `GET`  | `/api/rulesets/{id}/evaluation-stats` | 聚合已持久化决策：规则命中率与决策字段统计（支持 `version` / `since` / `until` 筛选） |
 | `GET`  | `/api/evaluations/{eval_id}` | 按 ID 查询单次决策结果 |
+| `POST` | `/api/evaluations/{eval_id}/corrections` | 人工复核后更正已落库决策（乐观并发 + 业务请求号幂等），追加修订记录 |
+| `GET`  | `/api/evaluations/{eval_id}/effective-decision` | 查询当前有效 decision（最新更正；无更正时为修订 0 原结果） |
+| `GET`  | `/api/evaluations/{eval_id}/corrections` | 按修订号升序列出某条决策的全部更正记录 |
 | `POST` | `/api/rulesets/{id}/recompute` | 用旧文档对最新版重算（保留旧结果） |
 
 ### 三分钟试用
@@ -702,6 +705,128 @@ curl -s 'localhost:8000/api/rulesets/demo-promotions/evaluation-stats?since=2026
 }
 ```
 
+### 决策人工更正（修订记录）
+
+已落库的决策（`persist=true` 计算出的 evaluation）在人工复核后可追加**更正记录**：
+
+- 原计算结果视为**修订 0**；每次更正成功后修订号在当前值上 **+1**
+  （首次更正为修订 1，依次递增），旧修订不可变、永不删除；
+- 提交体携带三个关键字段：
+  - `base_revision`：提交时基于的**当前修订号**（乐观并发）。只有它等于
+    当前修订号才能更正；过期基准返回 409；
+  - `request_no`：**业务请求号**，在同一决策内唯一，用作重试幂等键；
+  - `decision`：经复核后的**完整替代 decision 对象**（非空 JSON 对象，
+    整体替换原 decision；只传局部字段不会做合并）；
+- 更正**只追加修订记录**，不改原始决策、计算所用规则版本
+  （`version` 不变）和现有评估统计（evaluation-stats 仍统计原结果）；
+- 替代内容按对象键排序规范化后比较：键序不同但语义相同的 `decision`
+  视为相同内容（数组顺序是语义，不规范化）。
+
+#### 提交更正
+
+```bash
+# 先拿到一条已落库决策的 ID
+EID=$(curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"customer":{"vip":true},"amount":800,"region":"north","coupons":["SAVE20"]}}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 首次更正：基于修订 0 -> 201 Created，返回修订 1
+curl -i -X POST "localhost:8000/api/evaluations/$EID/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "base_revision": 0,
+        "request_no": "REVIEW-2026-001",
+        "decision": {"discount": 0.2, "reason": "manual_override",
+                     "free_shipping": true, "coupon": "SAVE20"}
+      }'
+```
+
+```json
+{
+  "id": "dd9cfc5dedce44bca84740937c4db855",
+  "evaluation_id": "da8f9815dbbc40e4b0f8649aae49b7e0",
+  "revision": 1,
+  "base_revision": 0,
+  "request_no": "REVIEW-2026-001",
+  "decision": {"coupon": "SAVE20", "discount": 0.2,
+               "free_shipping": true, "reason": "manual_override"},
+  "created_at": "2026-09-29T14:47:10+00:00"
+}
+```
+
+#### 重试幂等与冲突
+
+| 场景 | HTTP | 错误码 / 行为 |
+| --- | --- | --- |
+| 同一决策、同一 `request_no`，且基准与替代内容都相同的重试 | 200 | 返回**首次更正记录**（不重复写入）；即使之后已有后续更正也照常回放 |
+| 同号但 `base_revision` 不同 | 409 | `CORRECTION_BASE_CONFLICT`（details 给出 original/conflicting 基准） |
+| 同号、基准相同但替代 `decision` 内容不同 | 409 | `CORRECTION_CONTENT_CONFLICT` |
+| 新请求号但基准已过期（落后于当前修订） | 409 | `STALE_BASE_REVISION`（details 带回 `current_revision`） |
+| 找不到已落库决策 | 404 | `NOT_FOUND` |
+| `base_revision < 0` / 空 `decision` | 422 | Pydantic 校验错误 |
+| `request_no` 为纯空白 | 400 | `INVALID_REQUEST_NO` |
+
+```bash
+# 完全相同的请求重发 -> 200，响应体即首次记录（revision 仍为 1，不新增记录）
+curl -i -X POST "localhost:8000/api/evaluations/$EID/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":0,"request_no":"REVIEW-2026-001",
+       "decision":{"discount":0.2,"reason":"manual_override","free_shipping":true,"coupon":"SAVE20"}}'
+# HTTP/1.1 200 OK（同一 correction id、revision 1）
+
+# 新请求号但基准过期（当前已为 1，仍传 0）
+curl -i -X POST "localhost:8000/api/evaluations/$EID/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":0,"request_no":"REVIEW-2026-002","decision":{"discount":0.3}}'
+# HTTP/1.1 409 Conflict
+# {"error": {"code": "STALE_BASE_REVISION",
+#   "message": "基准修订号已过期：只有基准修订号等于当前修订号才能更正",
+#   "details": {"evaluation_id": "...", "field": "base_revision",
+#               "base_revision": 0, "current_revision": 1}}}
+
+# 基于最新修订 1 再次更正 -> 201，修订号递增到 2
+curl -i -X POST "localhost:8000/api/evaluations/$EID/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":1,"request_no":"REVIEW-2026-002",
+       "decision":{"discount":0.3,"reason":"supervisor_override"}}'
+```
+
+并发安全：同 `request_no` 的并发提交在写锁内复查，保证只有一个真正写入，
+其余按上面的规则回放首次记录或报冲突。
+
+#### 查询当前有效 decision 与按序更正记录
+
+```bash
+# 当前有效：有更正取最新修订（source=correction），无更正返回修订 0（source=original）
+curl -s "localhost:8000/api/evaluations/$EID/effective-decision" | python3 -m json.tool
+```
+
+```json
+{
+  "evaluation_id": "da8f9815dbbc40e4b0f8649aae49b7e0",
+  "ruleset_id": "demo-promotions",
+  "version": 1,
+  "revision": 2,
+  "decision": {"discount": 0.3, "reason": "supervisor_override"},
+  "source": "correction",
+  "correction_id": "…",
+  "request_no": "REVIEW-2026-002",
+  "corrected_at": "2026-09-29T14:48:02+00:00",
+  "evaluation_created_at": "2026-09-29T14:46:50+00:00"
+}
+```
+
+```bash
+# 按修订号升序返回全部更正记录（不含修订 0 原结果；从未更正时为空数组）
+curl -s "localhost:8000/api/evaluations/$EID/corrections" | python3 -m json.tool
+
+# 原始决策记录逐字段不变（仍可照常 GET；其 version/decision 与统计口径都不受影响）
+curl -s "localhost:8000/api/evaluations/$EID" | python3 -m json.tool
+```
+
+三个更正相关接口在决策不存在时都返回 404 `NOT_FOUND`。
+
 ### 循环依赖被拒绝
 
 ```bash
@@ -1025,5 +1150,10 @@ pytest -q
 版本号按目标递增不采用包内版本/摘要不符与重编译失败不写库/400 与 404）、
 单文档决策客户端幂等键（首次落库并固定版本/同键重放返回首次记录 ID/
 新版本发布仍固定首次版本/文档按对象键排序规范化/同键不同文档或版本选择方式 409/
-求值失败不占键/非持久化携带键 400/无键行为不变/键按规则集隔离/并发只落一条），
+求值失败不占键/非持久化携带键 400/无键行为不变/键按规则集隔离/并发只落一条）、
+决策人工更正（首次更正为修订 1 且当前有效随之切换/修订号按序递增/
+当前有效 decision 与按序更正记录查询/原始决策、规则版本与评估统计不变/
+同请求号同基准同内容重放回放首次记录且后续更正后仍回放/内容按对象键规范化/
+同号不同基准 409·同号同基准不同内容 409·过期基准 409/空白请求号 400/
+空 decision 与负基准 422/决策不存在 404/同号并发只落一条），
 以及完整 HTTP 接口。

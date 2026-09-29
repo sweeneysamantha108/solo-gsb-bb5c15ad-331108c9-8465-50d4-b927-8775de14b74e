@@ -76,6 +76,21 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     PRIMARY KEY (ruleset_id, key)
 );
 
+CREATE TABLE IF NOT EXISTS decision_corrections (
+    id            TEXT PRIMARY KEY,
+    evaluation_id TEXT NOT NULL REFERENCES evaluations(id),
+    revision      INTEGER NOT NULL,         -- 更正修订号；原计算结果视为 0，从 1 递增
+    base_revision INTEGER NOT NULL,         -- 提交时基于的当前修订号（乐观并发）
+    request_no    TEXT NOT NULL,            -- 业务请求号；同一决策内唯一（重试幂等键）
+    decision      TEXT NOT NULL,            -- 完整替代 decision 对象（规范化 JSON）
+    decision_hash TEXT NOT NULL,            -- 规范化替代 decision 的 sha256
+    created_at    TEXT NOT NULL,
+    UNIQUE(evaluation_id, revision),
+    UNIQUE(evaluation_id, request_no)
+);
+CREATE INDEX IF NOT EXISTS idx_corrections_evaluation
+    ON decision_corrections(evaluation_id, revision);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

@@ -524,3 +524,55 @@ class ErrorResponse(BaseModel):
     code: str
     message: str
     details: dict[str, Any] = {}
+
+
+# ---------- 决策人工更正 ----------
+
+
+class CorrectionRequest(BaseModel):
+    base_revision: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "提交时基于的当前修订号；原计算结果为修订 0。"
+            "只有等于当前修订号才能更正（乐观并发）"
+        ),
+    )
+    request_no: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="业务请求号；同一决策内唯一，作为重试幂等键",
+    )
+    decision: dict[str, Any] = Field(
+        ...,
+        min_length=1,
+        description="经人工复核后的完整替代 decision 对象（非空对象，整体替换原 decision）",
+    )
+
+
+class CorrectionOut(BaseModel):
+    id: str = Field(..., description="更正记录 ID")
+    evaluation_id: str = Field(..., description="被更正的已落库决策 ID")
+    revision: int = Field(
+        ..., ge=1, description="更正修订号；原计算结果为修订 0，首次更正为修订 1"
+    )
+    base_revision: int = Field(..., description="提交时基于的修订号")
+    request_no: str = Field(..., description="业务请求号")
+    decision: dict[str, Any] = Field(..., description="本次写入的完整替代 decision")
+    created_at: str
+
+
+class EffectiveDecisionOut(BaseModel):
+    evaluation_id: str
+    ruleset_id: str
+    version: int = Field(..., description="原决策计算所用规则版本（更正不改变）")
+    revision: int = Field(..., description="当前有效修订号；0 表示仍为原计算结果")
+    decision: dict[str, Any] = Field(..., description="当前有效 decision（最新更正或原结果）")
+    source: Literal["original", "correction"] = Field(
+        ..., description="original=原计算结果；correction=人工更正结果"
+    )
+    correction_id: str | None = Field(None, description="source=correction 时的更正记录 ID")
+    request_no: str | None = Field(None, description="source=correction 时的业务请求号")
+    corrected_at: str | None = Field(None, description="source=correction 时的更正时间")
+    evaluation_created_at: str = Field(..., description="原决策的计算落库时间")
